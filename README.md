@@ -1,4 +1,4 @@
-# RUN
+# RUN (Commands are based on RUNPOD)
 
 Commands only. Run in order. Use `tmux` for anything long.
 
