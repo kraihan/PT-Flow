@@ -41,11 +41,13 @@ find its way in.
 from __future__ import annotations
 
 from typing import Optional, Tuple
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 
 from models.generator import LightningDiT, TorchLinear
+from utils.precision import potential_autocast
 
 
 class PotentialNet(nn.Module):
@@ -167,10 +169,7 @@ class PotentialNet(nn.Module):
         cond = self.class_embed(c)
         if self.cond_proj is not None:
             cond = self.cond_proj(cond)
-        use_autocast = self.use_bf16 and x.device.type == "cuda"
-        with torch.amp.autocast(
-            device_type=x.device.type, dtype=torch.bfloat16, enabled=use_autocast
-        ):
+        with potential_autocast(x.device, self.use_bf16):
             field = self.trunk(x, cond, deterministic=True)  # [B, H, W, 1]
         # The readout is forced to fp32 regardless of the trunk's autocast dtype:
         # bf16 carries ~3 decimal digits, and the estimator needs the *spread* of
@@ -272,10 +271,7 @@ class ScaleNet(nn.Module):
         cond = self.class_embed(c)
         if self.cond_proj is not None:
             cond = self.cond_proj(cond)
-        use_autocast = self.use_bf16 and x.device.type == "cuda"
-        with torch.amp.autocast(
-            device_type=x.device.type, dtype=torch.bfloat16, enabled=use_autocast
-        ):
+        with potential_autocast(x.device, self.use_bf16):
             raw = self.trunk(x, cond, deterministic=True)
         return self.scale_max * torch.tanh(raw.float() / self.scale_max)
 
@@ -304,7 +300,9 @@ def phi_grad(
     """
     needs_leaf = not (x.requires_grad and create_graph)
     xin = x.detach().requires_grad_(True) if needs_leaf else x
-    with torch.enable_grad():
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    # Fused SDPA kernels do not implement the double backward needed by HVPs.
+    with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH) if create_graph else nullcontext():
         phi = potential.phi(xin, c)
         (g,) = torch.autograd.grad(phi.sum(), xin, create_graph=create_graph)
     return g, (phi if create_graph else phi.detach())

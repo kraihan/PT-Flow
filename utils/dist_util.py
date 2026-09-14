@@ -132,7 +132,6 @@ def _gather_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 def process_allgather(x: Any, tiled: bool = True) -> Any:
-    del tiled
     if torch.is_tensor(x):
         return _gather_tensor(x)
     if isinstance(x, dict):
@@ -157,6 +156,14 @@ def unwrap_ddp(model: torch.nn.Module) -> torch.nn.Module:
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         return model.module
     return model
+
+
+@torch.no_grad()
+def broadcast_module(module, src=0):
+    """Synchronize manual-allreduce modules before their first optimizer step."""
+    if dist_is_initialized():
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            dist.broadcast(tensor, src=src)
 
 
 def cleanup_distributed() -> None:

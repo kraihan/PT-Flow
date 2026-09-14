@@ -16,7 +16,7 @@ from typing import Dict, Iterable, Tuple
 import torch
 import torch.nn.functional as F
 
-_COMPILE = os.environ.get("DRIFT_COMPILE", "1") != "0"
+_COMPILE = torch.cuda.is_available() and os.environ.get("DRIFT_COMPILE", "0") != "0"
 
 
 # ---------------------------------------------------------------------------

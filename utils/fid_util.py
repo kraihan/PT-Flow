@@ -68,8 +68,9 @@ def _get_inception() -> _InceptionWrap:
 
 
 def _to_uint8(samples):
-    samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=0.0)
-    return (samples * 255).clip(0, 255).astype(np.uint8)
+    if not np.isfinite(samples).all():
+        raise ValueError("Nonfinite generated images: refusing to report FID on sanitized output.")
+    return (samples * 255).round().clip(0, 255).astype(np.uint8)
 
 
 def _extract_inception_features(
@@ -132,12 +133,14 @@ def _compute_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     sigma2 = np.atleast_2d(sigma2)
 
     diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
     if not np.isfinite(covmean).all():
         offset = np.eye(sigma1.shape[0]) * eps
         covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
     if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            raise ValueError("FID covariance square root has a significant imaginary component.")
         covmean = covmean.real
 
     tr_covmean = np.trace(covmean)
@@ -230,29 +233,38 @@ def evaluate_fid(
     samples_per_rank = (num_samples + world - 1) // world
 
     # --- 1. Each rank generates from its eval_loader shard ---
-    eval_iter = epoch0_sampler(eval_loader)
-    all_samples = []
-    cur = 0
-    it = tqdm(enumerate(eval_iter), desc="FID gen") if is_rank_zero() else enumerate(eval_iter)
-    for i, batch in it:
-        gen_samples = gen_func(batch, **gen_params, rng=int(rng_eval) + i)
+    if num_samples < 2:
+        raise ValueError("FID needs at least two generated samples.")
+    num_classes = 10 if _canonical_dataset_name(dataset_name) == "cifar10" else 1000
+    batch_size = int(eval_loader.batch_size)
+    # Labels are sufficient for unconditional-noise generation. Never stop at
+    # the end of CIFAR's 10k test set when 50k generated samples were requested.
+    all_features, all_logits_local = [], []
+    viz_images = None
+    starts = range(0, samples_per_rank, batch_size)
+    it = tqdm(starts, desc="FID gen/features", disable=not is_rank_zero())
+    for i, offset in enumerate(it):
+        count = min(batch_size, samples_per_rank - offset)
+        labels = (torch.arange(count) + rank * samples_per_rank + offset) % num_classes
+        batch = (None, labels)
+        gen_samples = gen_func(batch, **gen_params, rng=int(rng_eval) + i * world + rank)
 
         if torch.is_tensor(gen_samples):
             local_samples = gen_samples.detach().float().cpu().numpy()
         else:
             local_samples = np.asarray(gen_samples)
 
-        all_samples.append(_to_uint8(local_samples))
-        cur += local_samples.shape[0]
-        if cur >= samples_per_rank:
-            break
-
-    local_images = np.concatenate(all_samples, axis=0)[:samples_per_rank]
-
-    # --- 2. Each rank extracts Inception features locally ---
-    local_feats, local_logits = _extract_inception_features(
-        local_images, compute_logits=eval_isc,
-    )
+        local_images = _to_uint8(local_samples)
+        if len(local_images) != count:
+            raise ValueError("Generator returned the wrong FID batch size.")
+        if viz_images is None:
+            viz_images = local_images[:64]
+        feats, logits = _extract_inception_features(local_images, compute_logits=eval_isc)
+        all_features.append(feats)
+        if logits is not None:
+            all_logits_local.append(logits)
+    local_feats = np.concatenate(all_features)
+    local_logits = np.concatenate(all_logits_local) if all_logits_local else None
 
     # --- 3. All_gather features (small: ~50 MB/rank for 6250 images) ---
     feats_t = torch.from_numpy(local_feats.astype(np.float32))
@@ -289,7 +301,8 @@ def evaluate_fid(
             metrics["recall"] = float(recall)
 
         metrics["fid_time"] = float(time.time() - start)
+        metrics["num_samples"] = int(len(all_feats))
         logger.log_dict({f"{log_folder}/{log_prefix}_{k}": v for k, v in metrics.items()})
-        logger.log_image(f"{log_folder}/{log_prefix}_viz", local_images[:64])
+        logger.log_image(f"{log_folder}/{log_prefix}_viz", viz_images)
 
     return metrics

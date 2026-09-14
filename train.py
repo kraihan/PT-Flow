@@ -5,6 +5,8 @@ import copy
 import gc
 import os
 import time
+import statistics
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +25,8 @@ from ptflow.potential import PotentialNet, ScaleNet
 from ptflow.schedule import PTSchedule, build_schedule
 from ptflow.train_steps import global_mean, pt_generator_terms, pt_potential_step
 from utils.ckpt_util import restore_checkpoint, save_checkpoint, save_params_ema_artifact
-from utils.dist_util import barrier, maybe_ddp_model, process_count, process_index, unwrap_ddp
+from utils.dist_util import barrier, broadcast_module, maybe_ddp_model, process_count, process_index, unwrap_ddp
+from utils.precision import amp_dtype
 from utils.env import HF_ROOT
 from utils.fid_util import evaluate_fid
 from utils.init_util import maybe_init_state_params
@@ -66,6 +69,7 @@ class TrainState:
     ema_model: torch.nn.Module
     ema_decay: float
     pt: Optional[PTBundle] = None
+    scaler: Any = None
 
 
 def _generator_model_config(model) -> dict:
@@ -85,8 +89,9 @@ def _set_lr(optimizer: torch.optim.Optimizer, lr: float):
 @torch.no_grad()
 def _update_ema(ema_model: torch.nn.Module, model: torch.nn.Module, ema_decay: float):
     model = unwrap_ddp(model)
-    for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-        p_ema.mul_(ema_decay).add_(p, alpha=(1.0 - ema_decay))
+    ema_params, params = list(ema_model.parameters()), list(model.parameters())
+    torch._foreach_mul_(ema_params, ema_decay)
+    torch._foreach_add_(ema_params, params, alpha=1.0 - ema_decay)
     for b_ema, b in zip(ema_model.buffers(), model.buffers()):
         b_ema.copy_(b)
 
@@ -122,6 +127,7 @@ def train_step(
     ot_mode: str = "none",
     ot_kwargs: dict | None = None,
     diverse_noise: bool = False,
+    feature_chunk_size: int = 0,
 ):
     # ---- PT-Flow -------------------------------------------------------------
     # `state.pt` is None for a the plain baseline run and every PT branch below is a
@@ -133,7 +139,7 @@ def train_step(
 
     labels = torch.as_tensor(labels, device=device, dtype=torch.long)
 
-    _inline_feat = int(os.environ.get("DRIFT_FEAT_CHUNK", "0")) > 0
+    _inline_feat = feature_chunk_size > 0 or int(os.environ.get("DRIFT_FEAT_CHUNK", "0")) > 0
     samples = torch.as_tensor(samples, device=device)
     negative_samples = torch.as_tensor(negative_samples, device=device)
 
@@ -183,7 +189,7 @@ def train_step(
             sg_features = {k: rearrange(v, "(b x) f d -> b x f d", b=bsz, x=n_pos + n_uncond) for k, v in sg_features.items()}
 
     # --- learning rate ---
-    lr = float(learning_rate_fn(state.step)) if learning_rate_fn is not None else 0.0
+    lr = float(learning_rate_fn(state.step)) if learning_rate_fn is not None else state.optimizer.param_groups[0]["lr"]
     _set_lr(state.optimizer, lr)
 
     state.model.train()
@@ -356,20 +362,35 @@ def train_step(
                 for k2, v2 in pt_m.items():
                     pt_metrics_acc[k2] = pt_metrics_acc.get(k2, 0.0) + v2.detach()
 
-            scaled_loss = chunk_loss / actual_accum
-            scaled_loss.backward()
+            chunk_weight = chunk_bsz / bsz
+            scaled_loss = chunk_loss * chunk_weight
+            if state.scaler is not None:
+                state.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
 
-            total_loss_accum = total_loss_accum + chunk_loss.detach()
+            total_loss_accum = total_loss_accum + chunk_loss.detach() * chunk_weight
 
-    g_norm = torch.nn.utils.clip_grad_norm_(state.model.parameters(), max_grad_norm)
-    state.optimizer.step()
-    _update_ema(state.ema_model, state.model, state.ema_decay)
+    if state.scaler is not None:
+        state.scaler.unscale_(state.optimizer)
+    g_norm = torch.nn.utils.clip_grad_norm_(state.model.parameters(), max_grad_norm, error_if_nonfinite=state.scaler is None)
+    did_step = True
+    if state.scaler is not None:
+        old_scale = state.scaler.get_scale()
+        state.scaler.step(state.optimizer)
+        state.scaler.update()
+        did_step = state.scaler.get_scale() >= old_scale
+    else:
+        state.optimizer.step()
+    if did_step:
+        _update_ema(state.ema_model, state.model, state.ema_decay)
 
     metrics = {}
     for k, v in total_info.items():
         val = v / actual_accum
         metrics[k] = val.mean().detach() if torch.is_tensor(val) else torch.tensor(float(val), device=device)
-    metrics["loss"] = total_loss_accum / actual_accum
+    metrics["loss"] = total_loss_accum
+    metrics["optimizer_step_skipped"] = float(not did_step)
     metrics["g_norm"] = torch.as_tensor(g_norm, device=device)
     metrics["lr"] = torch.tensor(lr, device=device)
 
@@ -378,10 +399,13 @@ def train_step(
 
     # ---- PT-Flow (B) potential step, then (C) monitor and anneal -------------
     if pt is not None:
-        batch_ess = float(pt.sched.health.value)
-        if pt.sched.update_potential():
+        batch_ess = None
+        update_theta = pt.sched.update_potential()
+        check_health = pt.sched.step % max(1, pt.sched.health_check_period) == 0
+        if update_theta or check_health:
             pt_lr = float(pt.lr_fn(pt.sched.step)) if pt.lr_fn is not None else None
-            pt_m, batch_ess = pt_potential_step(
+            with nullcontext() if update_theta else torch.no_grad():
+                pt_m, batch_ess = pt_potential_step(
                 pt.potential,
                 pt.scale,
                 pt.optimizer,
@@ -396,7 +420,7 @@ def train_step(
                 p_uncond=float(pt_cfg.get("p_uncond", 0.1)),
                 lambda_gauge=float(pt_cfg.get("lambda_gauge", 0.1)),
                 lambda_mag=float(pt_cfg.get("lambda_mag", 0.0)),
-                logw_clip=float(pt_cfg.get("logw_clip", 30.0)),
+                logw_clip=float(pt_cfg.get("logw_clip", 0.0)),
                 max_grad_norm=float(pt_cfg.get("max_grad_norm", 1.0)),
                 lr=pt_lr,
                 chunk=int(pt_cfg.get("potential_chunk", 0)),
@@ -404,16 +428,18 @@ def train_step(
                 curv_allow=float(pt_cfg.get("curv_allow", 0.5)),
                 rng=rng,
                 device=device,
+                update=update_theta,
             )
-            _update_ema(pt.ema_potential, pt.potential, pt.ema_decay)
-            if pt.scale is not None and pt.ema_scale is not None:
-                _update_ema(pt.ema_scale, pt.scale, pt.ema_decay)
+            if update_theta:
+                _update_ema(pt.ema_potential, pt.potential, pt.ema_decay)
+                if pt.scale is not None and pt.ema_scale is not None:
+                    _update_ema(pt.ema_scale, pt.scale, pt.ema_decay)
             metrics.update(pt_m)
 
         # The health decision must be identical on every rank: it gates whether
         # the potential step runs at all and whether lambda_prox is nonzero, and
         # a disagreement would hang DDP on a mismatched backward.
-        pt.sched.observe(global_mean(batch_ess, device))
+        pt.sched.observe(global_mean(batch_ess, device) if batch_ess is not None else None)
         metrics.update(pt.sched.metrics(device=device))
 
     state.step += 1
@@ -485,13 +511,16 @@ def train_gen(
     keep_last=2,
     init_from="",
     push_per_step=0,
-    push_at_resume=3000,
+    push_at_resume=20,
     grad_accum_steps=1,
     workdir="runs",
     ot_mode="none",
     ot_kwargs=None,
     diverse_noise=False,
     pt_config=None,
+    feature_chunk_size=0,
+    eval_at_start=False,
+    benchmark_steps=0,
 ):
     if isinstance(ema_decay, (list, tuple)):
         if len(ema_decay) != 1:
@@ -544,6 +573,7 @@ def train_gen(
             ema_model.load_state_dict(model.state_dict())
 
         potential = PotentialNet(**_pt_model_cfg).to(device)
+        broadcast_module(potential)
         ema_potential = copy.deepcopy(potential).to(device)
         ema_potential.eval()
         for p in ema_potential.parameters():
@@ -555,6 +585,7 @@ def train_gen(
             for k in ("num_classes", "input_size", "in_channels", "cond_dim"):
                 _sc.setdefault(k, _pt_model_cfg[k])
             scale_net = ScaleNet(**_sc).to(device)
+            broadcast_module(scale_net)
             ema_scale = copy.deepcopy(scale_net).to(device)
             ema_scale.eval()
             for p in ema_scale.parameters():
@@ -595,14 +626,14 @@ def train_gen(
             pt_bundle.sched.lambda_prox_max,
         )
 
-    _compile = os.environ.get("DRIFT_COMPILE", "1") != "0"
+    _compile = device.type == "cuda" and os.environ.get("DRIFT_COMPILE", "0") != "0"
     if _compile and hasattr(model, "model"):
         if getattr(model.model, "use_remat", False):
             import torch._dynamo.config as _dynamo_config
             _dynamo_config.optimize_ddp = False
             log_for_0("Disabled DDPOptimizer (use_remat + torch.compile)")
         log_for_0("Compiling inner generator (LightningDiT) with torch.compile ...")
-        model.model = torch.compile(model.model, dynamic=True)
+        model.model.compile(dynamic=True)
 
     model = maybe_ddp_model(model, device_ids=[local_rank] if torch.cuda.is_available() else None)
 
@@ -620,6 +651,9 @@ def train_gen(
         step=0, model=model, optimizer=opt, ema_model=ema_model,
         ema_decay=ema_decay, pt=pt_bundle,
     )
+    raw_model = unwrap_ddp(model)
+    if amp_dtype(device, raw_model.precision, raw_model.use_bf16) == torch.float16:
+        state.scaler = torch.amp.GradScaler("cuda")
     state = restore_checkpoint(state=state, workdir=workdir)
     if int(state.step) == 0 and init_from:
         log_for_0("Initializing generator params from init_from=%s", init_from)
@@ -645,7 +679,10 @@ def train_gen(
     train_iter = infinite_sampler(train_loader, step)
     _ot_kw = dict(ot_kwargs) if ot_kwargs else {}
 
+    benchmark_times = []
     for step in pbar:
+        if benchmark_steps and torch.cuda.is_available():
+            torch.cuda.synchronize()
         start_time = time.time()
         n_push = 0
         logger.set_step(step)
@@ -714,10 +751,15 @@ def train_gen(
             ot_mode=ot_mode,
             ot_kwargs=_ot_kw,
             diverse_noise=diverse_noise,
+            feature_chunk_size=feature_chunk_size,
             **forward_dict,
         )
 
+        if benchmark_steps and torch.cuda.is_available():
+            torch.cuda.synchronize()
         total_time = time.time() - start_time
+        if benchmark_steps:
+            benchmark_times.append(total_time)
         metrics["total_time"] = total_time
         metrics["process_time"] = process_time
         metrics["kimg"] = (step + 1) * positive_samples.shape[0] / 1000.0
@@ -726,8 +768,19 @@ def train_gen(
 
         logger.log_dict(metrics)
         step += 1
+        if benchmark_steps and step - initial_step >= benchmark_steps:
+            measured = benchmark_times[min(5, len(benchmark_times) - 1):]
+            summary = {"benchmark/median_step_s": statistics.median(measured),
+                       "benchmark/mean_step_s": statistics.mean(measured),
+                       "benchmark/measured_steps": len(measured)}
+            if torch.cuda.is_available():
+                summary["benchmark/peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2**30
+            logger.log_dict(summary)
+            if is_rank_zero():
+                print("Benchmark:", summary)
+            break
 
-        if step % save_per_step == 0 or step == total_steps:
+        if not benchmark_steps and ((save_per_step > 0 and step % save_per_step == 0) or step == total_steps):
             save_checkpoint(state, keep=keep_last, keep_every=keep_every, workdir=workdir)
             if is_rank_zero():
                 save_params_ema_artifact(
@@ -737,7 +790,7 @@ def train_gen(
                     model_config=_generator_model_config(state.model),
                 )
 
-        if (step % eval_per_step == 0) or (step == 1) or (step == total_steps):
+        if eval_per_step > 0 and ((step % eval_per_step == 0) or (eval_at_start and step == 1) or (step == total_steps)):
             torch.cuda.empty_cache()
             is_sanity = step == 1
             n_samples = 500 if is_sanity else eval_samples
@@ -776,6 +829,13 @@ def main_gen(config, output_dir="runs"):
     if "logging" not in config:
         config.logging = {}
     config.logging.name = Path(output_dir).resolve().name
+    if is_rank_zero():
+        root = Path(output_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        config_path = root / "config.json"
+        if config_path.exists():
+            config_path = root / f"config_launch_{time.time_ns()}.json"
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     from models.generator import DitGen
 

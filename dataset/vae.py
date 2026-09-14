@@ -26,6 +26,7 @@ def vae_enc_decode(replicate_params: bool = True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vae = AutoencoderKL.from_pretrained(VAE_HF_PATH).to(device)
     vae.eval()
+    vae.requires_grad_(False)
 
     @torch.no_grad()
     def _encode_fn(images, rng=None):
@@ -45,8 +46,9 @@ def vae_enc_decode(replicate_params: bool = True):
         latents = latents * 0.18215
         return latents.permute(0, 2, 3, 1).contiguous()
 
-    @torch.no_grad()
     def _decode_fn(latents):
+        # Frozen weights still permit input gradients for RGB feature losses
+        # on generated latents. Inference callers already run under no_grad.
         z = _to_tensor(latents, device)
         if z.ndim != 4:
             raise ValueError(f"expected 4D tensor BHWC, got {tuple(z.shape)}")

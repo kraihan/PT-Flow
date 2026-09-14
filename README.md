@@ -1,4 +1,13 @@
-# RUN (Commands are based on RUNPOD)
+# PT-Flow
+
+**Current repaired launch instructions:** [RUN_GUIDE.md](RUN_GUIDE.md).
+**Verified findings and limits:** [AUDIT.md](AUDIT.md).
+Use `configs/gen/ptflow_cifar10_t4.yaml` for the new two-T4 CIFAR profile and
+`configs/gen/ptflow_imagenet_B_fresh.yaml` for the ImageNet B/2 comparison profile.
+The commands below are legacy notes, retained for reference; the run guide
+supersedes their setup, smoke schedules and evaluation instructions.
+
+# Legacy run notes
 
 Commands only. Run in order. Use `tmux` for anything long.
 

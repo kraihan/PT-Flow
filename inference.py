@@ -15,8 +15,9 @@ from tqdm import tqdm
 from dataset.dataset import get_postprocess_fn
 from models.generator import DitGen
 from utils.dist_util import barrier, init_distributed, process_count, process_index
-from utils.env import IMAGENET_FID_NPZ
+from utils.env import IMAGENET_FID_NPZ, CIFAR10_FID_NPZ
 from utils.misc import load_config, run_init
+from utils.ckpt_util import canonical_state_dict, check_model_behavior
 
 run_init()
 
@@ -59,7 +60,8 @@ def _load_model(ckpt_path: str, config_path: str, *, want_potential: bool = Fals
         _print0("WARNING: no ema_model in checkpoint, falling back to model weights")
         ema_sd = ckpt.get("model", ckpt)
 
-    missing, unexpected = model.load_state_dict(ema_sd, strict=False)
+    check_model_behavior(model, ckpt)
+    missing, unexpected = model.load_state_dict(canonical_state_dict(ema_sd), strict=True)
     if missing:
         _print0(f"WARNING: missing keys ({len(missing)}): {missing[:5]}")
     if unexpected:
@@ -247,6 +249,8 @@ def generate_and_save(
 
         pixel_images = postprocess_fn(latent_samples)
         pixel_np = pixel_images.detach().cpu().float().numpy()
+        if not np.isfinite(pixel_np).all():
+            raise ValueError("Nonfinite generated images; refusing FID evaluation.")
         pixel_np = np.clip(pixel_np, 0.0, 1.0)
 
         for b in range(device_batch_size):
@@ -286,6 +290,8 @@ def run_sample(
 
     pixel_images = postprocess_fn(latent_samples)
     imgs = pixel_images.detach().cpu().float().numpy()
+    if not np.isfinite(imgs).all():
+        raise ValueError("Nonfinite generated preview images.")
     imgs = np.clip(imgs, 0.0, 1.0)
     imgs = (imgs.transpose(0, 2, 3, 1) * 255).round().astype(np.uint8)
 
@@ -335,7 +341,7 @@ def run_eval(
         _print0("Computing metrics via torch-fidelity (inception-v3-compat) ...")
         metrics_dict = calculate_metrics(
             input1=save_folder, input2=fid_ref,
-            cuda=True, isc=True, fid=True, kid=False, prc=False, verbose=True,
+            cuda=device.type == "cuda", isc=True, fid=True, kid=False, prc=False, verbose=True,
         )
 
         fid = metrics_dict.get("frechet_inception_distance")
@@ -391,25 +397,20 @@ def run_likelihood(
         barrier()
         return None
 
-    from dataset.dataset import create_imagenet_split
+    from pipelines import build_pipeline
     from ptflow.sampling import log_likelihood
 
     config = load_config(config_path)
-    loader, preprocess_fn, _ = create_imagenet_split(
-        resolution=int(config.dataset.resolution),
-        use_aug=False,
-        use_latent=bool(config.dataset.get("use_latent", False)),
-        use_cache=bool(config.dataset.get("use_cache", False)),
-        batch_size=int(bsz),
-        split="val",
-        **config.dataset.kwargs,
-    )
+    loader, preprocess_fn, _ = build_pipeline(config).build_split(batch_size=int(bsz), split="val")
 
     rng = torch.Generator(device=device)
     rng.manual_seed(int(seed))
 
-    rows, it = [], iter(loader)
+    rows = []
     for K_eval in sorted(k_ladder):
+        # Evaluate each budget on the same examples and reset the MC stream.
+        it = iter(loader)
+        rng.manual_seed(int(seed))
         nlls, esss = [], []
         for _ in range(int(num_batches)):
             try:
@@ -446,9 +447,8 @@ def run_likelihood(
                    for a, b in zip(rows, rows[1:]))
     if not monotone:
         _print0(
-            "  WARNING: the ladder is NOT monotonically tightening.  The bound "
-            "has not converged (raise --k-inner, or check pt/ess in training); "
-            "do not quote these numbers."
+            "  The finite nested-MC estimates are not monotone. Check both "
+            "inner and outer budgets across seeds; this is not a certified likelihood bound."
         )
 
     result = {
@@ -459,7 +459,8 @@ def run_likelihood(
         "k_inner": int(k_inner),
         "ladder": rows,
         "monotone_tightening": bool(monotone),
-        "space": "sd-vae latent (not pixel bits/dim)",
+        "estimator": "nested_monte_carlo_not_a_certified_bound",
+        "space": "continuous CIFAR pixels in [-1,1]" if config.get("pipeline") == "cifar10_pixel" else "sd-vae latent (not pixel bits/dim)",
     }
     barrier()
     return result
@@ -520,23 +521,20 @@ def build_parser() -> argparse.ArgumentParser:
     ep = sub.add_parser("evaluate", parents=[shared], help="Generate 50k images and compute FID.")
     ep.add_argument("--num-samples", type=int, default=50000)
     ep.add_argument("--gen-bsz", type=int, default=64)
-    ep.add_argument("--fid-ref", type=str, default=IMAGENET_FID_NPZ)
+    ep.add_argument("--fid-ref", type=str, default="", help="Defaults to the config's dataset reference statistics.")
     ep.add_argument("--json-out", type=str, default="")
     ep.add_argument("--keep-samples", action="store_true")
 
     lp = sub.add_parser(
         "likelihood", parents=[shared],
-        help="Exactly-normalized per-sample NLL (Theorem 2.5), reported as an "
-             "IWAE-style bound along a ladder of evaluation budgets.",
+        help="Nested Monte Carlo likelihood estimate; check inner and outer budgets.",
     )
     lp.add_argument("--num-batches", type=int, default=8)
     lp.add_argument("--bsz", type=int, default=8)
     lp.add_argument("--k-inner", type=int, default=16)
     lp.add_argument(
         "--k-ladder", type=str, default="16,32,64,128",
-        help="Outer evaluation budgets K_eval.  The reported NLL must tighten "
-             "monotonically along this ladder; if it does not, the estimator is "
-             "not converged and the number should not be quoted.",
+        help="Outer evaluation budgets. Finite estimates have no monotonicity guarantee.",
     )
     lp.add_argument("--json-out", type=str, default="")
 
@@ -576,6 +574,8 @@ def main() -> None:
         barrier()
 
     elif args.mode == "evaluate":
+        if not args.fid_ref:
+            args.fid_ref = CIFAR10_FID_NPZ if model.num_classes == 10 and model.in_channels == 3 else IMAGENET_FID_NPZ
         result = run_eval(
             model, postprocess_fn, args.ckpt, ckpt_step,
             args.workdir,

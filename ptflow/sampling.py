@@ -108,27 +108,56 @@ def sample_mode_b(
     x0: Optional[torch.Tensor] = None,
     rng: Optional[torch.Generator] = None,
     return_trace: bool = False,
+    backtracking: bool = True,
 ):
     """n-step refinement:  y <- y - gamma [grad phi^w(y) + y - x0].
 
-    The step is a damped fixed-point iteration on the prox condition.  Under
-    (A2) the map y -> x0 - grad phi^w(y) is a contraction near the prox, so
-    gamma ~ 0.5 converges monotonically; gamma = 1 is the undamped Picard step
-    and is the first thing to lower if the residual trace is not monotone.
+    Weak convexity alone does not bound the largest Hessian eigenvalue, so a
+    fixed gamma=0.5 need not converge. By default use per-sample backtracking
+    on phi^w(y) + ||y-x0||^2/2. This controls the prox objective, not FID.
     """
     if pt_w is None:
         pt_w = float(cfg_scale) - 1.0
+    if gamma <= 0 or n_steps < 0:
+        raise ValueError("Require gamma > 0 and n_steps >= 0.")
 
     m, x0_used, _ = _generator_output(generator, c, cfg_scale, x0=x0, rng=rng)
     y = m.detach().clone()
     trace = []
+
+    @torch.no_grad()
+    def energy(point):
+        value = potential.phi(point, c)
+        if float(pt_w) != 0:
+            value = (1 + float(pt_w)) * value - float(pt_w) * potential.phi(point, potential.null_labels(c))
+        return value + 0.5 * (point - x0_used).flatten(1).square().sum(1)
 
     for _ in range(int(n_steps)):
         g = guided_phi_grad(potential, y, c, float(pt_w), create_graph=False)
         resid = g + y - x0_used
         if return_trace:
             trace.append(resid.detach().flatten(1).norm(dim=1).mean().item())
-        y = y - float(gamma) * resid
+        if not torch.isfinite(resid).all():
+            raise ValueError("Nonfinite prox residual during refinement.")
+        if backtracking:
+            before = energy(y)
+            step_size = torch.full((len(y),), float(gamma), device=y.device)
+            norm2 = resid.flatten(1).square().sum(1)
+            accepted = torch.zeros(len(y), dtype=torch.bool, device=y.device)
+            next_y = y.clone()
+            for _ in range(12):
+                candidate = y - step_size.view(-1, *([1] * (y.ndim - 1))) * resid
+                after = energy(candidate)
+                good = torch.isfinite(after) & (after <= before - 1e-4 * step_size * norm2)
+                take = good & ~accepted
+                next_y = torch.where(take.view(-1, *([1] * (y.ndim - 1))), candidate, next_y)
+                accepted |= good
+                if bool(accepted.all()):
+                    break
+                step_size = torch.where(accepted, step_size, step_size * 0.5)
+            y = next_y
+        else:
+            y = y - float(gamma) * resid
 
     if return_trace:
         g = guided_phi_grad(potential, y, c, float(pt_w), create_graph=False)
@@ -221,16 +250,16 @@ def log_likelihood(
         psi_hat_1(x) = E_z[ (rho_0 / psi_0)(x + sqrt(2 eps) z) ]
 
     with every inner psi_0 evaluated by the tilted estimator.  Two Monte-Carlo
-    layers plus an outer logarithm make this an IWAE-style *bound*, not an
-    unbiased point estimate, so the reporting protocol (Appendix G) is a ladder
-    over K_outer with its monotone tightening curve, at w = 0 only -- Theorem
-    2.5 applies to the untilted model.
+    layers make this a biased nested Monte Carlo estimate. The reciprocal of
+    the estimated inner psi0 is biased, so an IWAE lower-bound or monotone
+    tightening guarantee does not follow from the outer logarithm. Check
+    convergence in BOTH K_outer and K_inner, at w = 0.
 
     Two caveats worth stating in any table produced from this:
-      * The value is a latent-space density.  Converting to pixel bits/dim
-        requires the VAE's own Jacobian term, which is not modelled here.
-      * The generator supplies the proposal for every inner estimator, so a
-        badly-tracking generator shows up as a loose bound, not as a wrong one.
+      * The value is a density in the training space. A lossy stochastic VAE
+        needs an observation model to define a pixel likelihood; there is no
+        invertible change-of-variables Jacobian for this decoder.
+      * Poor proposals can bias the finite nested estimate in either direction.
     """
     B = x1.shape[0]
     tail = x1.shape[1:]
@@ -261,6 +290,7 @@ def log_likelihood(
     log_p = log_psi1_hat - potential.phi(x1, c) / (2.0 * float(eps))
 
     info = {
+        "estimator": "nested_monte_carlo_not_a_certified_bound",
         "nll_nats": (-log_p).mean().item(),
         "nll_per_dim": (-log_p).mean().item() / d,
         "bits_per_dim_latent": (-log_p).mean().item() / (d * math.log(2.0)),

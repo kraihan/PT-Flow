@@ -98,9 +98,16 @@ class WandbLogger:
         if not is_rank_zero():
             return
         reduced = {}
+        tensor_groups = {}
         for k, v in d.items():
             if torch.is_tensor(v):
-                v = float(v.detach().float().mean().item())
+                tensor_groups.setdefault(v.device, []).append((k, v.detach().float().mean()))
+        for entries in tensor_groups.values():
+            values = torch.stack([v for _, v in entries]).cpu().tolist()
+            reduced.update({k: value for (k, _), value in zip(entries, values)})
+        for k, v in d.items():
+            if torch.is_tensor(v):
+                continue
             elif isinstance(v, np.ndarray):
                 v = float(np.asarray(v).mean())
             if isinstance(v, (int, float, np.floating, np.integer)):

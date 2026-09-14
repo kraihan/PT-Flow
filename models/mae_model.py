@@ -12,7 +12,7 @@ from einops import rearrange
 
 from utils.env import HF_REPO_ID, HF_ROOT
 
-_COMPILE = os.environ.get("DRIFT_COMPILE", "1") != "0"
+_COMPILE = torch.cuda.is_available() and os.environ.get("DRIFT_COMPILE", "0") != "0"
 
 
 def _choose_gn_groups(num_channels: int, max_groups: int = 32) -> int:
@@ -248,7 +248,7 @@ class MAEResNetJAX(nn.Module):
         self.use_bf16 = bool(use_bf16)
         self.input_patch_size = int(input_patch_size)
 
-        self.dtype = torch.bfloat16 if (self.use_bf16 and torch.cuda.is_available()) else torch.float32
+        self.dtype = torch.bfloat16 if (self.use_bf16 and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8) else torch.float32
 
         enc_in_channels = self.in_channels * self.input_patch_size * self.input_patch_size
         self.encoder = _ResNetEncoder(
@@ -408,11 +408,12 @@ def build_feature_model_and_params(
     path: str = "",
     use_convnext: bool = False,
     convnext_bf16: bool = False,
+    convnext_model_name: str = "base",
 ):
     if use_convnext:
         from models.convnext import load_convnext_torch_model
 
-        return load_convnext_torch_model(model_name="base", use_bf16=convnext_bf16)
+        return load_convnext_torch_model(model_name=convnext_model_name, use_bf16=convnext_bf16)
 
     if not path:
         raise ValueError("`path` is required when use_convnext=False.")
@@ -430,7 +431,7 @@ def build_feature_model_and_params(
     for p in feature_model.parameters():
         p.requires_grad_(False)
     if _COMPILE:
-        feature_model.encoder = torch.compile(feature_model.encoder, dynamic=True)
+        feature_model.encoder.compile(dynamic=True)
     return feature_model, feature_model.state_dict()
 
 
@@ -440,6 +441,9 @@ def build_activation_function(
     convnext_bf16=False,
     use_mae=True,
     postprocess_fn=lambda x: x,
+    convnext_model_name="base",
+    feature_chunk_size=0,
+    checkpoint_features=False,
 ):
     variables = {}
     feature_model = None
@@ -450,10 +454,10 @@ def build_activation_function(
         variables["mae_params"] = feature_params
 
     if use_convnext:
-        convnext_model, convnext_feature_params = build_feature_model_and_params(use_convnext=True, convnext_bf16=convnext_bf16)
+        convnext_model, convnext_feature_params = build_feature_model_and_params(use_convnext=True, convnext_bf16=convnext_bf16, convnext_model_name=convnext_model_name)
         variables["convnext_params"] = convnext_feature_params
 
-    def activation_fn(params, x, convnext_kwargs=dict(), has_scale=False, **kwargs):
+    def activation_impl(params, x, convnext_kwargs=dict(), has_scale=False, **kwargs):
         del params
         usual_feats = {}
         usual_feats["global"] = x.reshape(x.shape[0], 1, -1)
@@ -461,19 +465,34 @@ def build_activation_function(
             usual_feats["norm_x"] = torch.sqrt((x**2).mean(dim=(1, 2)) + 1e-6)[:, None, :]
 
         if use_mae:
-            feature_model.to(x.device)
+            if next(feature_model.parameters()).device != x.device:
+                feature_model.to(x.device)
             mae_feats = feature_model.get_activations(x, **kwargs)
             usual_feats = {**usual_feats, **mae_feats}
 
         if use_convnext:
-            convnext_model.to(x.device)
+            if next(convnext_model.parameters()).device != x.device:
+                convnext_model.to(x.device)
             xx = postprocess_fn(x)
             xx = xx.permute(0, 2, 3, 1).contiguous().float()
             mean = torch.tensor([0.485, 0.456, 0.406], device=xx.device)
             std = torch.tensor([0.229, 0.224, 0.225], device=xx.device)
             xx = (xx - mean) / std
-            convnext_feats = convnext_model.get_activations(xx, **convnext_kwargs)
+            from utils.precision import amp_dtype, autocast_context
+            with autocast_context(x.device, amp_dtype(x.device, use_bf16=convnext_bf16)):
+                convnext_feats = convnext_model.get_activations(xx, **convnext_kwargs)
             usual_feats = {**usual_feats, **convnext_feats}
         return usual_feats
+
+    def activation_fn(params, x, **kwargs):
+        def run(part):
+            if checkpoint_features and torch.is_grad_enabled() and part.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+                return checkpoint(lambda xx: activation_impl(params, xx, **kwargs), part, use_reentrant=False)
+            return activation_impl(params, part, **kwargs)
+        if feature_chunk_size > 0 and len(x) > feature_chunk_size:
+            parts = [run(part) for part in x.split(feature_chunk_size)]
+            return {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
+        return run(x)
 
     return activation_fn, variables

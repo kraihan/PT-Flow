@@ -23,6 +23,10 @@ class ArrayMemoryBank:
         self.bank = np.zeros((self.num_classes, self.max_size, *self.feature_shape), dtype=self.dtype)
 
     def add(self, samples, labels) -> None:
+        if torch.is_tensor(samples):
+            samples = samples.detach().cpu().numpy()
+        if torch.is_tensor(labels):
+            labels = labels.detach().cpu().numpy()
         samples = np.asarray(samples)
         labels = np.asarray(labels)
         if self.bank is None:
@@ -47,7 +51,7 @@ class ArrayMemoryBank:
             lbl = int(labels[i])
             valid = int(self.count[lbl])
             if valid <= 0:
-                sample_indices[i] = np.zeros((n_samples,), dtype=np.int32)
+                raise ValueError(f"Class {lbl} has no real samples in the memory bank.")
             else:
                 sample_indices[i] = np.random.choice(valid, n_samples, replace=(valid < n_samples))
 

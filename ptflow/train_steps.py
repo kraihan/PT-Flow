@@ -146,7 +146,7 @@ def pt_potential_step(
     p_uncond: float = 0.1,
     lambda_gauge: float = 0.1,
     lambda_mag: float = 0.0,
-    logw_clip: float = 30.0,
+    logw_clip: float = 0.0,
     max_grad_norm: float = 1.0,
     lr: Optional[float] = None,
     chunk: int = 0,
@@ -154,6 +154,7 @@ def pt_potential_step(
     curv_allow: float = 0.5,
     rng: Optional[torch.Generator] = None,
     device: torch.device = torch.device("cpu"),
+    update: bool = True,
 ) -> Tuple[Dict[str, torch.Tensor], float]:
     """One theta update on the flat objective.  Returns (metrics, batch ESS).
 
@@ -196,12 +197,13 @@ def pt_potential_step(
         with torch.no_grad():
             s0 = unwrap_ddp(scale_net)(m0, c0).detach().float()
 
-    if lr is not None:
+    if update and lr is not None:
         for pg in potential_opt.param_groups:
             pg["lr"] = float(lr)
 
     potential.train()
-    potential_opt.zero_grad(set_to_none=True)
+    if update:
+        potential_opt.zero_grad(set_to_none=True)
 
     loss, est, metrics = potential_loss(
         pot, x0, c0, x1.float(), c1, m0, s0, eps,
@@ -209,6 +211,13 @@ def pt_potential_step(
         lambda_gauge=float(lambda_gauge), lambda_mag=float(lambda_mag),
         logw_clip=float(logw_clip), generator=rng, chunk=int(chunk),
     )
+
+    # Raw normalized ESS has floor 1/K: with K=8 a collapsed estimate is
+    # 0.125, so the old 0.05 'broken' threshold was unreachable.
+    control_ess = ((est.ess - 1.0 / K) / (1.0 - 1.0 / K)).clamp(0, 1) if K > 1 else torch.zeros_like(est.ess)
+    metrics["pt/control_ess"] = control_ess.mean().detach()
+    if not update:
+        return metrics, float(control_ess.mean().item())
 
     # -- scale head: reverse KL at the same prox points ---------------------
     if scale_net is not None and sched.lambda_scale > 0.0:
@@ -233,14 +242,14 @@ def pt_potential_step(
         sn = unwrap_ddp(scale_net)
         allreduce_grads_(sn)
         theta_params += list(sn.parameters())
-    gnorm = torch.nn.utils.clip_grad_norm_(theta_params, float(max_grad_norm))
+    gnorm = torch.nn.utils.clip_grad_norm_(theta_params, float(max_grad_norm), error_if_nonfinite=True)
     potential_opt.step()
 
     metrics["pt/g_norm_potential"] = torch.as_tensor(gnorm, device=device)
     if lr is not None:
         metrics["pt/lr_potential"] = torch.as_tensor(float(lr), device=device)
 
-    return metrics, float(est.ess.mean().item())
+    return metrics, float(control_ess.mean().item())
 
 
 # ---------------------------------------------------------------------------

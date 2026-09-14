@@ -49,6 +49,7 @@ def url_to_path(url_or_path: str) -> str:
         if not os.path.exists(local_path):
             vprint(True, f"Downloading {url_or_path} to {local_path}...")
             response = requests.get(url_or_path, stream=True)
+            response.raise_for_status()
             with open(local_path, "wb") as f:
                 shutil.copyfileobj(response.raw, f)
         return local_path
@@ -104,7 +105,7 @@ def calculate_metrics(**kwargs) -> dict:
         feature_extractor, list(feature_layers), **kwargs
     )
 
-    if (not have_isc) and have_fid and (not have_kid):
+    if (not have_isc) and have_fid and (not have_kid) and not str(input2).endswith(".npz"):
         metric_fid = fid_inputs_to_metric(feat_extractor, **kwargs)
         metrics.update(metric_fid)
     else:
@@ -131,7 +132,8 @@ def calculate_metrics(**kwargs) -> dict:
 
             ref_path = url_to_path(input2)
             x = np.load(ref_path)
-            fid_stats_2 = {"mu": x["mu"], "sigma": x["sigma"]}
+            fid_stats_2 = {"mu": x["ref_mu"] if "ref_mu" in x else x["mu"],
+                           "sigma": x["ref_sigma"] if "ref_sigma" in x else x["sigma"]}
             metric_fid = fid_statistics_to_metric(
                 fid_stats_1, fid_stats_2, get_kwarg("verbose", kwargs)
             )

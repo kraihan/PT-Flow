@@ -68,6 +68,7 @@ EXPECTED = [
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
+    assert cond, f"{name}: {detail}"
     print(f"  [{'ok  ' if cond else 'FAIL'}] {name}" + (f"   {detail}" if detail else ""))
 
 
@@ -90,7 +91,8 @@ def test_shape_identity():
                   f"missing {pt_path if not pt_path.exists() else base_path}")
             continue
 
-        g_pt, g_ref = build(pt_path), build(base_path)
+        with torch.device("meta"):
+            g_pt, g_ref = build(pt_path), build(base_path)
         sd_pt = {k: tuple(v.shape) for k, v in g_pt.state_dict().items()}
         sd_ref = {k: tuple(v.shape) for k, v in g_ref.state_dict().items()}
         p_pt = sum(p.numel() for p in g_pt.parameters())
@@ -131,7 +133,8 @@ def test_residual_adds_no_parameters():
           not torch.allclose(ya, yb), f"||diff|| = {(ya - yb).norm().item():.4f}")
 
 
-def test_roundtrip_resume(tmp: Path):
+def test_roundtrip_resume(tmp_path: Path):
+    tmp = tmp_path
     print("\n3. A reference checkpoint resumes, and the result loads back")
     from ptflow.potential import PotentialNet, ScaleNet
     from ptflow.schedule import build_schedule

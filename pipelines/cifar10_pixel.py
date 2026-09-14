@@ -82,4 +82,7 @@ class Cifar10PixelPipeline(Pipeline):
             convnext_bf16=bool(cfg.get("convnext_bf16", True)),
             use_mae=False,
             postprocess_fn=cifar_postprocess(has_clip=False),
+            convnext_model_name=str(cfg.get("convnext_model", "tiny")),
+            feature_chunk_size=int(cfg.get("chunk_size", 64)),
+            checkpoint_features=bool(cfg.get("checkpoint", False)),
         )

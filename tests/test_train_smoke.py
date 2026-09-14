@@ -39,6 +39,7 @@ HW, CH, NUM_CLASSES = 8, 2, 10
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
+    assert cond, f"{name}: {detail}"
     print(f"  [{'ok  ' if cond else 'FAIL'}] {name}" + (f"   {detail}" if detail else ""))
 
 

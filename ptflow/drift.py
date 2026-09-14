@@ -5,7 +5,7 @@ from typing import Dict, Iterable, Tuple
 
 import torch
 
-_COMPILE = os.environ.get("DRIFT_COMPILE", "1") != "0"
+_COMPILE = torch.cuda.is_available() and os.environ.get("DRIFT_COMPILE", "0") != "0"
 
 
 def cdist(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:

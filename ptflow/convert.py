@@ -28,6 +28,7 @@ from typing import Dict, Tuple
 import torch
 
 from utils.logging import log_for_0
+from utils.ckpt_util import canonical_state_dict, check_model_behavior
 
 
 def inspect_checkpoint(ckpt_path: str) -> Dict[str, object]:
@@ -63,6 +64,13 @@ def check_resume_compatible(model, ckpt_path: str, *, strict: bool = True) -> Tu
         return False, msg
 
     want = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    try:
+        check_model_behavior(model, ck)
+    except ValueError as exc:
+        if strict:
+            raise
+        return False, str(exc)
+    sd = canonical_state_dict(sd)
     have = {k: tuple(v.shape) for k, v in sd.items()}
 
     missing = sorted(set(want) - set(have))
@@ -119,5 +127,5 @@ def load_baseline_into_generator(generator, ckpt_path: str, *, prefer_ema: bool 
 
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = (ck.get("ema_model") if prefer_ema else None) or ck.get("model", ck)
-    generator.load_state_dict(sd, strict=True)
+    generator.load_state_dict(canonical_state_dict(sd), strict=True)
     log_for_0("Initialized generator from %s (step %s)", ckpt_path, ck.get("step", "?"))

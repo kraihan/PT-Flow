@@ -215,7 +215,7 @@ def tilted_phi0(
     alpha_def: float = 0.1,
     generator: Optional[torch.Generator] = None,
     antithetic: bool = True,
-    logw_clip: float = 30.0,
+    logw_clip: float = 0.0,
     y: Optional[torch.Tensor] = None,
     chunk: int = 0,
 ) -> TiltedEstimate:
@@ -244,6 +244,8 @@ def tilted_phi0(
     B = x0.shape[0]
     tail = x0.shape[1:]
     K = int(K)
+    if K < 1 or eps <= 0 or not 0 <= alpha_def <= 1:
+        raise ValueError("Require K >= 1, eps > 0 and alpha_def in [0, 1].")
 
     if y is None:
         with torch.no_grad():
@@ -270,19 +272,23 @@ def tilted_phi0(
 
     # -- centering: exact, and the only thing that keeps fp32 alive at cold eps
     phi_ref = phi_y.detach().mean(dim=1, keepdim=True)               # [B,1]
-    u_centered = (phi_y - phi_ref) / (2.0 * float(eps))              # [B,K], O(1)
+    u_centered = (phi_y.double() - phi_ref.double()) / (2.0 * float(eps))
 
     # fp64 for the combination: log_ratio and the u-term individually run to
     # ~1e5 and cancel to O(1) (the exact cancellation of Appendix E.1), so the
     # subtraction is where precision is won or lost.  Autograd passes through
     # the cast, and [B,K] is far too small for the cost to matter.
     log_w = log_ratio - u_centered.double()                          # [B,K] fp64
+    raw_log_w = log_w
 
     # -- safety clip (bias-for-variance; logged so it stays visible)
     if logw_clip is not None and logw_clip > 0:
         ref = log_w.detach().median(dim=1, keepdim=True).values
         ceiling = ref + float(logw_clip)
-        clipped = torch.minimum(log_w, ceiling)
+        clipped_values = torch.minimum(log_w.detach(), ceiling)
+        # Optional biased robust estimator: preserve each phi derivative.
+        # A hard min with a detached ceiling zeroed the dominant gradients.
+        clipped = log_w + (clipped_values - log_w.detach())
         clip_frac = (log_w.detach() > ceiling).float().mean()
         log_w = clipped
     else:
@@ -294,11 +300,12 @@ def tilted_phi0(
     phi0 = (phi_ref.squeeze(1).double() - 2.0 * float(eps) * lse).float()
 
     with torch.no_grad():
-        lw = log_w.detach()
+        # Health must describe the actual importance weights, never the clip.
+        lw = raw_log_w.detach()
         lse1 = torch.logsumexp(lw, dim=1)
         lse2 = torch.logsumexp(2.0 * lw, dim=1)
         ess = torch.exp(2.0 * lse1 - lse2 - math.log(K)).clamp(0.0, 1.0)
-        spread = lw.std(dim=1)
+        spread = lw.std(dim=1, correction=0)
 
     return TiltedEstimate(
         phi0=phi0,

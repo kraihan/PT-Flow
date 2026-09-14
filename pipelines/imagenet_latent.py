@@ -88,4 +88,6 @@ class ImageNetLatentPipeline(Pipeline):
             convnext_bf16=bool(cfg.get("convnext_bf16", False)),
             use_mae=use_mae,
             postprocess_fn=postprocess_noclip,
+            feature_chunk_size=int(cfg.get("chunk_size", 64)),
+            checkpoint_features=bool(cfg.get("checkpoint", False)),
         )

@@ -10,6 +10,18 @@ from utils.dist_util import barrier, unwrap_ddp
 from utils.logging import is_rank_zero, log_for_0
 
 
+def canonical_state_dict(state_dict):
+    """Accept older checkpoints saved through torch.compile wrappers."""
+    return {".".join(p for p in k.split(".") if p != "_orig_mod"): v for k, v in state_dict.items()}
+
+
+def check_model_behavior(model, payload):
+    saved = payload.get("model_behavior", {})
+    for key, value in saved.items():
+        if getattr(unwrap_ddp(model), key) != value:
+            raise ValueError(f"Checkpoint {key}={value!r} differs from model config. Tensor shapes alone do not establish compatibility.")
+
+
 def _to_python_int(x) -> int:
     if torch.is_tensor(x):
         return int(x.detach().cpu().reshape(-1)[0].item())
@@ -60,14 +72,17 @@ def restore_checkpoint(step=None, state=None, workdir: Optional[str] = None):
     if state is None:
         return payload
 
-    unwrap_ddp(state.model).load_state_dict(payload["model"], strict=True)
+    check_model_behavior(state.model, payload)
+    unwrap_ddp(state.model).load_state_dict(canonical_state_dict(payload["model"]), strict=True)
     if (
         getattr(state, "ema_model", None) is not None
         and "ema_model" in payload
         and payload["ema_model"] is not None
     ):
-        unwrap_ddp(state.ema_model).load_state_dict(payload["ema_model"], strict=True)
+        unwrap_ddp(state.ema_model).load_state_dict(canonical_state_dict(payload["ema_model"]), strict=True)
     state.optimizer.load_state_dict(payload["optimizer"])
+    if getattr(state, "scaler", None) is not None and payload.get("grad_scaler"):
+        state.scaler.load_state_dict(payload["grad_scaler"])
     state.step = int(payload.get("step", 0))
     state.ema_decay = float(payload.get("ema_decay", getattr(state, "ema_decay", 0.999)))
 
@@ -126,6 +141,8 @@ def save_checkpoint(state, keep=2, keep_every=None, workdir: Optional[str] = Non
         "ema_model": {k: v.detach().cpu() for k, v in unwrap_ddp(state.ema_model).state_dict().items()} if getattr(state, "ema_model", None) is not None else None,
         "optimizer": state.optimizer.state_dict(),
         "ema_decay": float(getattr(state, "ema_decay", 0.999)),
+        "model_behavior": {"residual": bool(getattr(unwrap_ddp(state.model), "residual", False))},
+        "grad_scaler": state.scaler.state_dict() if getattr(state, "scaler", None) is not None else None,
     }
 
     # PT-Flow state goes in under pt_* keys only.  "model" and "ema_model" stay
@@ -148,7 +165,9 @@ def save_checkpoint(state, keep=2, keep_every=None, workdir: Optional[str] = Non
         payload["pt_optimizer"] = pt.optimizer.state_dict()
         payload["pt_schedule"] = pt.sched.state_dict()
 
-    torch.save(payload, path)
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
     log_for_0("Saving checkpoint step %d to %s", step, str(path))
 
     ckpts = _list_ckpts(ckpt_dir)

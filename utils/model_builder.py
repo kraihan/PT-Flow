@@ -68,6 +68,11 @@ def build_model_dict(config, model_class, *, workdir: str = "runs", pipeline=Non
 
     print("Building dataset...")
     world = max(1, process_count())
+    for name, size in (("dataset.batch_size", config.dataset.batch_size),
+                       ("dataset.eval_batch_size", config.dataset.eval_batch_size),
+                       ("train.train_batch_size", config.train.train_batch_size)):
+        if size < world or size % world:
+            raise ValueError(f"{name}={size} must be positive and divisible by world_size={world}.")
     train_loader, preprocess_fn, postprocess_fn = pipeline.build_split(
         split="train", batch_size=config.dataset.batch_size // world,
     )

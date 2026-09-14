@@ -49,14 +49,14 @@ def _download_artifact(
     root = f"models/{kind}/{backend}/{model_id}"
     path_in_repo = f"{prefix.strip('/')}/{root}" if prefix else root
 
-    # snapshot_download(
-    #     repo_id=repo_id,
-    #     repo_type="model",
-    #     allow_patterns=[f"{path_in_repo}/*"],
-    #     local_dir=str(local_root),
-    # )
     nested = local_root / path_in_repo
-    return nested if nested.exists() else local_root
+    if (local_root / "metadata.json").is_file():
+        return local_root
+    if (nested / "metadata.json").is_file():
+        return nested
+    snapshot_download(repo_id=repo_id, repo_type="model",
+                      allow_patterns=[f"{path_in_repo}/*"], local_dir=str(output_root))
+    return Path(output_root) / path_in_repo
 
 
 def _load_torch_or_convert(

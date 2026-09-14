@@ -78,7 +78,7 @@ def potential_loss(
     alpha_def: float = 0.1,
     lambda_gauge: float = 0.1,
     lambda_mag: float = 0.0,
-    logw_clip: float = 30.0,
+    logw_clip: float = 0.0,
     generator: Optional[torch.Generator] = None,
     chunk: int = 0,
 ) -> Tuple[torch.Tensor, TiltedEstimate, Dict[str, torch.Tensor]]:
@@ -199,7 +199,8 @@ def prox_loss(
     d = float(x0[0].numel())
 
     if mode == "full":
-        g = guided_phi_grad(potential, m, c, w, create_graph=True)
+        with _frozen(potential):
+            g = guided_phi_grad(potential, m, c, w, create_graph=True)
         resid = g + m - x0
     elif mode == "detach":
         g = guided_phi_grad(potential, m.detach(), c, w, create_graph=False)
@@ -212,7 +213,7 @@ def prox_loss(
         disp_scale = torch.ones((), device=resid.device, dtype=resid.dtype)
         loss = resid.pow(2).flatten(1).sum(1).mean() / d
 
-    elif norm == "rms":
+    elif norm in ("rms", "bounded_rms"):
         # Normalize the TARGET DISPLACEMENT, not the residual.  the OT-drift baseline builds
         #     goal = old_gen + V_raw / rms(V_raw)
         # and regresses onto that, so its gradient stays O(1).  Normalizing the
@@ -224,6 +225,9 @@ def prox_loss(
                              'which a detached target would silently discard.')
         disp = (-resid).detach()                    # x0 - grad phi(m) - m
         disp_scale = disp.pow(2).mean().sqrt().clamp_min(1e-8)
+        if norm == "bounded_rms":
+            # Cap large targets without amplifying a small residual.
+            disp_scale = disp_scale.clamp_min(1.0)
         tgt = (m.detach() + disp / disp_scale).detach()
         loss = (m - tgt).pow(2).flatten(1).sum(1).mean() / d
 
@@ -366,8 +370,8 @@ def curvature_hinge(
     ).to(x.dtype).mul_(2).sub_(1)
 
     if g_at_x is None:
-        g_at_x, _ = phi_grad(potential, x, c)
-    g_pert, _ = phi_grad(potential, x + float(h) * v, c)
+        g_at_x, _ = phi_grad(potential, x, c, create_graph=True)
+    g_pert, _ = phi_grad(potential, x + float(h) * v, c, create_graph=True)
 
     curv = ((g_pert - g_at_x) * v).flatten(1).sum(1) / (float(h) * d)
     pen = torch.relu(-curv - float(lambda_allow)).mean()

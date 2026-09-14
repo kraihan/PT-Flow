@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from utils.logging import log_for_0
+from utils.precision import amp_dtype, autocast_context
 
 
 class ConvNextLayerNorm(nn.Module):
@@ -154,10 +155,12 @@ class ConvNextV2(nn.Module):
         self.norm = ConvNextLayerNorm(self.dims[-1], eps=1e-6)
         self.head = nn.Linear(self.dims[-1], self.num_classes, dtype=dtype)
 
-    def get_activations(self, x: torch.Tensor) -> dict:
+    def get_activations(self, x: torch.Tensor, image_size: int = 224) -> dict:
         # x: NHWC
         x = x.permute(0, 3, 1, 2).contiguous()
-        x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        if image_size < 32 or image_size % 32:
+            raise ValueError("ConvNeXt image_size must be a multiple of 32, at least 32.")
+        x = F.interpolate(x, size=(image_size, image_size), mode="bilinear", align_corners=False)
         x = x.permute(0, 2, 3, 1).contiguous().to(dtype=self.dtype)
         feature_dict = {}
 
@@ -215,7 +218,7 @@ def _map_hf_key_to_local(path: str) -> str:
 
 
 def load_convnext_torch_model(model_name: str = "base", use_bf16: bool = False):
-    dtype = torch.bfloat16 if (use_bf16 and torch.cuda.is_available()) else torch.float32
+    dtype = torch.float32
     if model_name == "base":
         model = ConvNextBase(dtype=dtype)
         model_load_name = "facebook/convnextv2-base-22k-224"
@@ -244,7 +247,10 @@ def load_convnext_torch_model(model_name: str = "base", use_bf16: bool = False):
             missing.append(k)
             loaded[k] = t
 
-    model.load_state_dict(loaded, strict=False)
+    # The classifier is unused by get_activations. 22k checkpoints may have a
+    # different classifier width; every feature-producing tensor must match.
+    missing = [k for k in missing if not k.startswith("head.")]
+    model.load_state_dict(loaded, strict=True)
     if missing:
         log_for_0("[ConvNeXt] missing keys while loading pretrained weights: %s", missing)
         raise ValueError(f"ConvNeXt pretrained weight loading has {len(missing)} missing keys: {missing}")

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 
 from utils.env import HF_REPO_ID, HF_ROOT
+from utils.precision import amp_dtype, autocast_context
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -445,7 +446,7 @@ class LightningDiT(nn.Module):
 
         for blk in self.blocks:
             if self.use_remat and self.training:
-                x = torch.utils.checkpoint.checkpoint(lambda _x, _c: blk(_x, _c, deterministic), x, c, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(blk, x, c, deterministic, use_reentrant=False)
             else:
                 x = blk(x, c, deterministic)
 
@@ -515,6 +516,7 @@ class DitGen(nn.Module):
         use_remat: bool = False,
         # --- PT-Flow addition (adds NO parameters; see note below) ---
         residual: bool = False,
+        precision: str = "auto",
     ):
         super().__init__()
         self.cond_dim = int(cond_dim)
@@ -535,6 +537,9 @@ class DitGen(nn.Module):
         self.use_rope = bool(use_rope)
         self.use_rmsnorm = bool(use_rmsnorm)
         self.use_bf16 = bool(use_bf16)
+        self.precision = str(precision)
+        if int(cond_dim) != int(hidden_size):
+            raise ValueError("Generator cond_dim must equal hidden_size.")
         self.attn_fp32 = bool(attn_fp32)
         self.use_remat = bool(use_remat)
 
@@ -668,8 +673,7 @@ class DitGen(nn.Module):
         else:
             noise_labels = torch.zeros((B, max(1, self.noise_coords)), dtype=torch.long, device=device)
 
-        _use_autocast = self.use_bf16 and device.type == "cuda"
-        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=_use_autocast):
+        with autocast_context(device, amp_dtype(device, self.precision, self.use_bf16)):
             cond = self.c_cfg_noise_to_cond(c, cfg_scale, noise_labels)
             samples = self.generate_image(x, cond, deterministic=deterministic)
 

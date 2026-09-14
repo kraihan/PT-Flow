@@ -134,7 +134,7 @@ pt:
   scale_mode: learned
   lambda_gauge: 0.1
   lambda_mag: 0.0
-  logw_clip: 30.0
+  logw_clip: 0.0
   max_grad_norm: 1.0
   curv_probe: false
   curv_allow: 0.5

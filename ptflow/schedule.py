@@ -120,6 +120,7 @@ class PTSchedule:
 
     theta_period: int = 1          # potential update every N steps
     theta_period_degraded: int = 2
+    health_check_period: int = 20
 
     health: EstimatorHealth = field(default_factory=EstimatorHealth)
 
@@ -186,16 +187,16 @@ class PTSchedule:
 
     # -- the controller ----------------------------------------------------
 
-    def observe(self, ess: float) -> str:
+    def observe(self, ess: float | None) -> str:
         """Feed one batch's ESS/K in and advance every gated schedule."""
-        state = self.health.update(ess)
+        state = self.health.update(ess) if ess is not None else self.health.state
 
-        if state == HEALTHY:
+        if state == HEALTHY and ess is not None:
             self.eps_progress += 1
             if self.step >= self.prox_warmup:
                 inc = 1.0 / max(1, int(self.prox_ramp))
                 self.prox_progress = min(1.0, self.prox_progress + inc)
-        else:
+        elif state != HEALTHY:
             # Do not advance the anneal; walk the PT term back toward the OT-drift baseline.
             self.prox_progress *= float(self.prox_decay_on_degrade)
 

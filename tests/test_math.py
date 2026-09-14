@@ -39,6 +39,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     (PASS if cond else FAIL).append(name)
     mark = "ok  " if cond else "FAIL"
     print(f"  [{mark}] {name}" + (f"   {detail}" if detail else ""))
+    assert cond, f"{name}: {detail}"
 
 
 # ---------------------------------------------------------------------------
