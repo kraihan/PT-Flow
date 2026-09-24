@@ -1,281 +1,150 @@
 # PT-Flow
 
-**Current repaired launch instructions:** [RUN_GUIDE.md](RUN_GUIDE.md).
-**Verified findings and limits:** [AUDIT.md](AUDIT.md).
-Use `configs/gen/ptflow_cifar10_t4.yaml` for the new two-T4 CIFAR profile and
-`configs/gen/ptflow_imagenet_B_fresh.yaml` for the ImageNet B/2 comparison profile.
-The commands below are legacy notes, retained for reference; the run guide
-supersedes their setup, smoke schedules and evaluation instructions.
+One-step Schrödinger-bridge generation by proximal tilting, trained from **W-Flow weights**
+(B/2, L/2, XL/2) on class-conditional ImageNet 256 in SD-VAE latent space.
 
-# Legacy run notes
+Training and inference follow the paper's theory directly:
 
-Commands only. Run in order. Use `tmux` for anything long.
+- The generator is the proximal map of a learned potential: **T(x₀) = prox_φ(x₀) = m_η(x₀)**.
+- The potential is fitted by the bridge likelihood objective, estimated with the prox-tilted estimator.
+- ε is annealed by the ESS controller of Algorithm 1.
+- Sampling is 1 NFE (Mode A), with the refined (B) and resampled (C) modes also available.
 
----
+The W-Flow checkpoint is used **only as the initialization**. No W-Flow loss, memory bank, MAE
+features or teacher is used.
 
-## 0. Setup (once)
+## Theory → code
 
-```bash
-cd /workspace/code && rm -rf PT-Flow && unzip -q ~/PT-Flow.zip && cd PT-Flow
-```
-
-```bash
-pip install -U pip
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
-pip install diffusers==0.29.1 transformers==4.46.1 huggingface_hub==0.24.7 \
-            safetensors accelerate numpy==1.26.4 tqdm wandb absl-py einops \
-            psutil pyyaml scipy torch-fidelity gdown "jax[cpu]==0.4.31" flax==0.8.5
-pip uninstall -y flash-attn flash_attn flash_attn_interface
-```
-
-```bash
-python -c "import torch,diffusers,safetensors.torch,accelerate;from diffusers.models import AutoencoderKL;print('env ok |',torch.cuda.get_device_name(0))"
-```
-
-Edit `utils/env.py`:
-
-```bash
-cat > utils/env.py << 'EOF'
-from __future__ import annotations
-
-A = "/workspace/assets"
-
-HF_REPO_ID = "Goodeat/drifting"
-HF_ROOT = f"{A}/mae"
-VAE_HF_PATH = f"{A}/sdvae"
-TORCH_HUB_DIR = f"{A}/torch_hub"
-
-BASELINE_HF_REPO_ID = ""
-BASELINE_HF_ROOT = ""
-BASELINE_CKPTS = {}
-
-CIFAR10_PATH = "/workspace/data/cifar10"
-CIFAR10_FID_NPZ = f"{A}/fid_stats/cifar10_train_fid_stats.npz"
-
-IMAGENET_PATH = "/workspace/data/imagenet"
-IMAGENET_CACHE_PATH = "/workspace/data/latents"
-IMAGENET_FID_NPZ = f"{A}/fid_stats/jit_in256_stats.npz"
-IMAGENET_PR_NPZ = ""
-EOF
-```
-
-```bash
-python -m misc.download_pretrained
-```
-
-```bash
-python -m tests.test_math && python -m tests.test_train_smoke
-```
-
----
-
-## 1. CIFAR-10
-
-### 1.1 Data
-
-```bash
-python -m misc.download_cifar10
-```
-
-### 1.2 FID reference
-
-```bash
-python -m scripts.make_cifar10_fid_stats
-```
-
-### 1.3 Smoke (20 steps)
-
-```bash
-python - << 'EOF'
-import yaml
-c = yaml.safe_load(open("configs/gen/ptflow_cifar10.yaml"))
-c["train"].update(total_steps=20, save_per_step=10, eval_per_step=10**9)
-c["logging"]["log_every_k"] = 1
-yaml.safe_dump(c, open("configs/gen/_smoke_c10.yaml", "w"), sort_keys=False)
-EOF
-```
-
-```bash
-torchrun --nproc_per_node=1 --master_port=29555 train.py --config configs/gen/_smoke_c10.yaml --workdir /workspace/runs/smoke_c10
-```
-
-### 1.4 Train
-
-```bash
-tmux new -s c10
-```
-
-```bash
-cd /workspace/code/PT-Flow && torchrun --nproc_per_node=1 --master_port=29550 train.py --config configs/gen/ptflow_cifar10.yaml --workdir /workspace/runs/ptflow_cifar10
-```
-
-Resume after any stop: re-run the identical command.
-
-### 1.5 Monitor
-
-```bash
-tail -f /workspace/runs/ptflow_cifar10/log/metrics.jsonl
-```
-
-### 1.6 Sample
-
-```bash
-python inference.py sample --ckpt /workspace/runs/ptflow_cifar10/checkpoints/state_00020000.pt --config configs/gen/ptflow_cifar10.yaml --sampler A --cfg-scale 1.5 --class-ids "0,1,2,3,4,5,6,7,8,9" --num-rows 4 --save-path /workspace/runs/c10_grid.png
-```
-
-### 1.7 Evaluate
-
-```bash
-CKPT=/workspace/runs/ptflow_cifar10/checkpoints/state_00020000.pt CONFIG=configs/gen/ptflow_cifar10.yaml NGPU=1 bash scripts/eval_fid/eval_modes.sh
-```
-
----
-
-## 2. ImageNet B
-
-### 2.1 Pipeline check on a 10-class subset (1.5 GB, ~10 min)
-
-```bash
-mkdir -p /workspace/data && cd /workspace/data && curl -L -o imagenette2.tgz https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz && tar xzf imagenette2.tgz && mv imagenette2 imagenette && cd /workspace/code/PT-Flow
-```
-
-```bash
-python -m dataset.latent --data-path /workspace/data/imagenette --target-path /workspace/data/latents_imagenette --local-batch-size 64 --num-workers 4 --pin-memory
-```
-
-```bash
-ls -la /workspace/data/latents_imagenette
-```
-
-### 2.2 Data
-
-```bash
-df -h /workspace
-```
-
-```bash
-hf auth login
-hf download ILSVRC/imagenet-1k --repo-type dataset --local-dir /workspace/data/imagenet_raw
-```
-
-Accept the dataset terms on huggingface.co first (gated repo).
-
-The download is archives, not `ImageFolder`. Convert to
-`/workspace/data/imagenet/{train,val}/<wnid>/*.JPEG` before continuing:
-
-```bash
-ls -la /workspace/data/imagenet_raw && find /workspace/data/imagenet_raw -maxdepth 2 -type f | head -20
-```
-
-Verify before the cache build — both must print `1000`, and val must list
-wnids (`n01440764`), not `.JPEG` filenames:
-
-```bash
-ls /workspace/data/imagenet/train | wc -l && ls /workspace/data/imagenet/val | wc -l && ls /workspace/data/imagenet/val | head -3
-```
-
-### 2.3 Latent cache (hours, ~85 GB)
-
-```bash
-tmux new -s cache
-```
-
-```bash
-cd /workspace/code/PT-Flow && python -m dataset.latent --data-path /workspace/data/imagenet --target-path /workspace/data/latents --local-batch-size 128 --num-workers 8 --pin-memory
-```
-
-### 2.4 FID reference
-
-Place `jit_in256_stats.npz` at `/workspace/assets/fid_stats/`, or skip FID with
-`train.eval_per_step: 1000000000`.
-
-```bash
-ls -la /workspace/assets/fid_stats/jit_in256_stats.npz
-```
-
-### 2.5 Config for 1 GPU
-
-```bash
-python - << 'EOF'
-import yaml
-c = yaml.safe_load(open("configs/gen/ptflow_scratch.yaml"))
-c["dataset"]["batch_size"] = 256
-c["dataset"]["eval_batch_size"] = 500
-c["train"].update(train_batch_size=16, pos_per_sample=32, neg_per_sample=8,
-                  grad_accum_steps=4, push_per_step=64, eval_per_step=10000)
-c["train"]["forward_dict"]["gen_per_label"] = 16
-c["pt"]["prox_max_batch"] = 64
-yaml.safe_dump(c, open("configs/gen/ptflow_B_1gpu.yaml", "w"), sort_keys=False)
-print("wrote configs/gen/ptflow_B_1gpu.yaml")
-EOF
-```
-
-### 2.6 Smoke (20 steps)
-
-```bash
-python - << 'EOF'
-import yaml
-c = yaml.safe_load(open("configs/gen/ptflow_B_1gpu.yaml"))
-c["train"].update(total_steps=20, save_per_step=10, eval_per_step=10**9)
-c["logging"]["log_every_k"] = 1
-yaml.safe_dump(c, open("configs/gen/_smoke_b.yaml", "w"), sort_keys=False)
-EOF
-```
-
-```bash
-torchrun --nproc_per_node=1 --master_port=29556 train.py --config configs/gen/_smoke_b.yaml --workdir /workspace/runs/smoke_b
-```
-
-### 2.7 Train
-
-```bash
-tmux new -s inb
-```
-
-```bash
-cd /workspace/code/PT-Flow && torchrun --nproc_per_node=1 --master_port=29551 train.py --config configs/gen/ptflow_B_1gpu.yaml --workdir /workspace/runs/ptflow_B
-```
-
-### 2.8 Monitor
-
-```bash
-tail -f /workspace/runs/ptflow_B/log/metrics.jsonl
-```
-
-### 2.9 Evaluate
-
-```bash
-CKPT=/workspace/runs/ptflow_B/checkpoints/state_00020000.pt CONFIG=configs/gen/ptflow_B_1gpu.yaml NGPU=1 bash scripts/eval_fid/eval_modes.sh
-```
-
----
-
-## Multi-GPU
-
-Set `--nproc_per_node=N`. Multi-node: also export `NNODES`, `NODE_RANK`,
-`MASTER_ADDR`, `MASTER_PORT`.
-
-## L / XL
-
-```bash
-python -m tests.test_ckpt_compat
-```
-
-```bash
-torchrun --nproc_per_node=8 train.py --config configs/gen/ptflow_L.yaml  --workdir /workspace/runs/ptflow_L
-torchrun --nproc_per_node=8 train.py --config configs/gen/ptflow_XL.yaml --workdir /workspace/runs/ptflow_XL
-```
-
-## OOM
-
-Raise `train.grad_accum_steps`, or lower `train.forward_dict.gen_per_label`.
-
-## Checks
-
-| Where | Expect |
+| Paper | Code |
 |---|---|
-| smoke banner | `32x32x3 (d = 3072)` CIFAR · `32x32x4 (d = 4096)` ImageNet |
-| `ess` step 0 | ≈ 1.00 |
-| `ess` steady | > 0.3 |
-| `sched_eps` | reaches `eps_min` |
-| `lambda_prox` | 0 until `prox_warmup`, then ramps |
+| φ = 2ε u, ψ₁ = e^{−u} (App. B) | `ptflow/models/potential.py` `Potential.phi` (network outputs φ; every equation uses u = φ/2ε) |
+| ψ₀ = G_{2ε} ∗ ψ₁ (eq. 3), tilted IS (eqs. 9–10, 15) | `ptflow/estimator.py` `tilted_estimate` |
+| Defensive mixture q_def, antithetic ±z | `estimator.draw_noise`, `log_kernel_over_proposal` |
+| Potential loss L_θ (eq. 14) at w = 0, conditioning dropout | `ptflow/losses.py` `potential_loss` |
+| Generator loss ‖2ε g_w(m) + m − x₀‖² (eq. 16) | `losses.generator_loss` (`mode: full` = through ∇φ, `detach` = fixed-point target) |
+| Scale head s_η, Hutchinson match to diag(I + ∇²φ) (Alg. 1 line 8) | `Generator.scale_layer`, `losses.hutchinson_diag` |
+| CFG as potential arithmetic φ^w = (1+w)φ_c − wφ_∅ (eq. 17) | `potential.guided_grad`, `estimator.potential_phi_fn` |
+| (A2) curvature monitor + hinge (App. L) | `losses.curvature_hinge` |
+| Algorithm 1 steps A / B / C, ESS thresholds 0.3 / 0.05, cosine ε anneal | `train.py`, `ptflow/schedule.py` |
+| Algorithm 2 Modes A / B / C | `ptflow/sampling.py` |
+| Likelihood log ρ̂₁ = log ψ̂₁ − u (Thm 3.5, App. J) | `ptflow/likelihood.py` (nested MC) |
+| SNIS posterior mean = bridge conditional mean T_ε(x₀) | `TiltedEstimate.posterior_mean` (logged as `est/tmean_gap_rms`) |
+
+## How a run proceeds
+
+1. **Initialize from W-Flow.**
+   - The generator gets the W-Flow EMA weights, so m_η starts as the pretrained sampler.
+   - W-Flow also draws 32 random discrete noise codes per sample. The theory needs one map x₀ ↦ prox(x₀), so the codes are folded into a single fixed conditioning bias (`init.noise_code: fixed:0`, or `mean`).
+   - The scale head is new and zero-initialized (S = I).
+   - The potential copies the first `depth` W-Flow blocks and has a zero readout, so φ ≡ 0 at step 0.
+2. **Stage 0: calibration.**
+   - A pretrained generator is not the prox of a zero potential. Starting Algorithm 1 from that pair puts the proposal far from the target mode, and the importance weights collapse. This is what stopped the earlier B_PT_Full run at step 368.
+   - So with the generator frozen, θ is fitted to make m the prox: it minimizes ‖∇φ^w(m) + m − x₀‖² over θ for w ∈ [0, w_max]. Pairs with w > 0 also identify the unconditional potential through eq. 17.
+   - Stage 0 ends when the relative residual is at most `calib_tol` and the generator-centred proposal's control ESS is at least 0.3. It also ends after `calib_max_steps`; the reason is written to `calibration.json`.
+3. **Algorithm 1**, every step:
+   - **(A)** n_η generator steps at frozen θ (eq. 16 plus the scale match), with w ~ U[0, w_max].
+   - **(B)** one potential step at frozen η with w = 0 (eq. 14). It is skipped while the estimator is *broken*; the ESS is still measured, forward only.
+   - **(C)** the controller:
+
+     | State | Control ESS | Action |
+     |---|---|---|
+     | healthy | ≥ 0.3 | advance the cosine ε anneal |
+     | degrading | 0.05 to 0.3 | hold ε, raise α, double n_η |
+     | broken | < 0.05 | freeze θ, retrain η |
+
+   The health signal is the control ESS (ESS − 1)/(K − 1). It is ESS/K with the 1/K floor removed; without that, 0.05 is unreachable for K < 20.
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+cp scripts/env.example.sh ~/ptflow_env.sh      # edit paths, then:
+source ~/ptflow_env.sh
+python scripts/download_assets.py --models B L XL    # W-Flow checkpoints, SD-VAE, Inception
+# latent cache (skip if you already have W-Flow's cache: same format)
+python -m ptflow.data build-cache --imagenet /path/to/imagenet --out $IMAGENET_CACHE_PATH
+python -m pytest -q                                  # CPU tests, ~30 s
+```
+
+Environment variables:
+
+| Variable | Contents |
+|---|---|
+| `IMAGENET_CACHE_PATH` | Latent cache: `{train,val}_{moments,moments_flip,targets}.npy` |
+| `WFLOW_ROOT` | Local copy of `jiaqihan99/W-Flow` |
+| `VAE_PATH` | Local copy of `stabilityai/sd-vae-ft-mse` |
+| `FID_REF_NPZ` | `jit_in256_stats.npz` |
+| `TORCH_HUB_DIR` | Cache for the torch-fidelity Inception weights |
+
+## Recommended order
+
+```bash
+# 0. Pre-flight (no training)
+#    a. What folding the noise codes costs the initializer: FID with random vs fixed codes
+sbatch --gpus=h200:8 scripts/eval.sbatch evaluate-wflow --config configs/B.yaml --noise-code random --cfg-scales 1.2 --num-samples 10000
+sbatch --gpus=h200:8 scripts/eval.sbatch evaluate-wflow --config configs/B.yaml --noise-code fixed:0 --cfg-scales 1.2 --num-samples 10000
+#    b. Can the W-Flow map be a prox map, and what ESS can a diagonal proposal reach even with a perfect potential?
+python experiments.py jacobian --config configs/B.yaml --out results/B_preflight --n 8 --chunk 256
+
+# 1. Train (calibration, then Algorithm 1); requeues itself before the wall time
+sbatch --gpus=h200:8 scripts/train.sbatch configs/B.yaml runs/B
+#    extra overrides: ... runs/B -o train.total_steps=80000 -o schedule.eps_min=0.05
+
+# 2. FID-50K (Mode A = 1 NFE; also try B and C)
+sbatch --gpus=h200:8 scripts/eval.sbatch evaluate --ckpt runs/B/checkpoints/state_XXXXXXXX.pt \
+       --mode A --cfg-scales 1.0,1.2,1.4,1.6 --json-out runs/B/fid50k_A.json
+
+# 3. Mechanism experiments on the same checkpoint
+C=runs/B/checkpoints/state_XXXXXXXX.pt
+python experiments.py proposals --ckpt $C --out results/B   # full proposal vs naive / recentred / diagonal
+python experiments.py eps-sweep --ckpt $C --out results/B   # ESS, Var(log w), chi2 vs eps + Laplace mismatch
+python experiments.py prox      --ckpt $C --out results/B   # residual quantiles, Mode-B refinement, |T_eps - m|
+python experiments.py mismatch  --ckpt $C --out results/B   # centre shift / variance multiplier / alpha
+python experiments.py nll       --ckpt $C --out results/B   # latent NLL over (K_outer x K_inner) x seeds
+python experiments.py toy                 --out results/toy # exact T_eps vs prox by quadrature (O(eps) gap)
+```
+
+## What to watch
+
+These are in `metrics.jsonl` (and W&B when `logging.use_wandb: true`); `status.json` holds the latest values.
+
+| Metric | Meaning | Healthy |
+|---|---|---|
+| `calib/resid_rel` | ‖∇φ(m) + m − x₀‖ / ‖m − x₀‖ during stage 0 | falls toward `calib_tol` |
+| `calib/control_ess`, `est/control_ess` | Importance-weight health (the controller input) | ≥ 0.3 |
+| `gen/resid_rel` | How far m_η is from prox_φ (eq. 16) | small and stable |
+| `est/tmean_gap_rms` | Per-coordinate RMS of T̂_ε(x₀) − m_η(x₀): the T = prox = m check | small; meaningful only when ESS is not near 0 |
+| `est/var_logw`, `est/chi2` | s²_res and the χ² divergence of Thm 3.9 | — |
+| `sched/eps`, `sched/health` | Anneal position and controller state (2 healthy, 1 degrading, 0 broken) | — |
+| `curv/violation_frac` | Share of probes with curvature below −`curv_allow` | ≈ 0 |
+| `fid/cfg*` | FID-10K of the EMA generator (Mode A) every `eval_every` steps | — |
+
+If calibration exits on `calib_max_steps` with a large residual, or the controller stays *broken*, run
+`experiments.py jacobian` and `eps-sweep`. They separate a map that is not a gradient field from an
+off-diagonal curvature floor. A diagonal proposal cannot remove that floor for any ε (Thm 3.9 needs
+‖B‖²_F = O(ε)).
+
+## Layout
+
+```
+train.py            calibration + Algorithm 1 (torchrun, resume, periodic FID, requeue)
+inference.py        sample grid; FID for modes A/B/C; W-Flow baseline with random/fixed codes
+experiments.py      proposals, eps-sweep, prox, mismatch, nll, jacobian, toy
+configs/            B.yaml L.yaml XL.yaml (W-Flow architectures), smoke.yaml (CPU tests)
+ptflow/models/      dit.py (W-Flow LightningDiT), generator.py (m, s, W-Flow loading), potential.py (φ, ∇φ, HVP)
+ptflow/             estimator, losses, schedule, sampling, likelihood, data, vae, fid, evaluate, ckpt, dist, config, logger
+scripts/            train.sbatch, eval.sbatch, env.example.sh, download_assets.py
+tests/              CPU tests (estimator exactness/unbiasedness, likelihood normalization, W-Flow loading, training/resume, experiments)
+```
+
+## Status and caveats
+
+- **Tested on CPU only.** That covers:
+  - the closed-form estimator checks and the unbiasedness check;
+  - normalization of ρ̂₁ in 1-D;
+  - HVPs against finite differences;
+  - W-Flow loading against the upstream model code;
+  - single- and two-process training with resume, and every experiment.
+- **Not yet run on GPU or real data.** No PT-Flow ImageNet result exists yet: start with the pre-flight runs above.
+- **ε is outside the asymptotic window.** The paper's defaults (ε 0.2 → 0.1) give εd = 400–800 at d = 4096, far outside its εd ≲ 1 window. The variance-reversal and Laplace statements are therefore motivation here, and the experiments measure how well they hold.
+- **The likelihood is an estimate, not a bound.** It is a nested Monte-Carlo estimate of an analytically normalized *latent* density, with no certified bias direction. Report it over the budget grid and seeds, and don't compare it to pixel bits/dim.
