@@ -38,9 +38,11 @@ def save(workdir: str, step: int, payload: Dict, *, keep_last: int = 2, keep_eve
     dist.barrier()
 
 
-def save_eval(workdir: str, step: int, payload: Dict) -> Path:
-    """Permanent EMA-only checkpoint for an FID point (never rotated; not used for resume)."""
-    path = Path(workdir, "checkpoints", f"eval_state_{step:08d}.pt")
+def save_named(workdir: str, name: str, payload: Dict) -> Path:
+    """Permanent checkpoint under a name outside the state_*.pt rotation (never deleted; not used for resume)."""
+    if name.startswith("state_"):
+        raise ValueError("Named checkpoints must not use the rotated state_ prefix")
+    path = Path(workdir, "checkpoints", name)
     dist.barrier()
     if dist.is_main():
         path.parent.mkdir(parents=True, exist_ok=True)

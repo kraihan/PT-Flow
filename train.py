@@ -138,6 +138,7 @@ def main() -> None:
         x0 = torch.randn((tc["batch_gen"], *shape), generator=rng, device=device)
         eps = sched.eps()
         metrics = {}
+        calibrated_now = False
 
         if sched.phase == "calibrate":
             # ---- stage 0: make the W-Flow generator the prox of the potential -------------------
@@ -166,7 +167,8 @@ def main() -> None:
                 ess = dist.mean_scalar(float(weight_stats(est.log_w)["control_ess"].mean()), device)
                 metrics["calib/control_ess"] = ess
             sched.observe_calibration(resid, ess)
-            if sched.phase == "pt" and dist.is_main():
+            calibrated_now = sched.phase == "pt"
+            if calibrated_now and dist.is_main():
                 print(f"[calibration] {sched.calib_exit}", flush=True)
                 logger.write_json("calibration.json", {"exit": sched.calib_exit, "step": step, **sched.metrics()})
         else:
@@ -214,6 +216,12 @@ def main() -> None:
             ess = dist.mean_scalar(float(weight_stats(est.log_w)["control_ess"].mean()), device)
             sched.observe(ess)
         step += 1
+        if calibrated_now:
+            # Full, permanent checkpoint at the calibrated pair (generator still exactly W-Flow):
+            # the reference point for the mechanism figures and the start of any secondary run.
+            path = ckpt.save_named(workdir, f"calib_state_{step:08d}.pt", payload_now())
+            if dist.is_main():
+                print(f"[calibration] saved {path}", flush=True)
 
         if step % int(tc.get("log_every", 20)) == 0 or step == 1:
             metrics.update(sched.metrics())
@@ -233,7 +241,7 @@ def main() -> None:
         if eval_every and sched.phase == "pt" and sched.pt_step % eval_every == 0 and sched.pt_step > 0:
             from ptflow.evaluate import evaluate_fid
             # The exact EMA weights being scored, kept permanently so the best FID point can be reused.
-            eval_ckpt = ckpt.save_eval(workdir, step, {
+            eval_ckpt = ckpt.save_named(workdir, f"eval_state_{step:08d}.pt", {
                 "step": step, "config": cfg, "init_info": info, "schedule": sched.state_dict(),
                 "generator_ema": ckpt.module_state(gen_ema), "potential_ema": ckpt.module_state(pot_ema)})
             for cs in tc.get("eval_cfg_scales", [1.0]):
