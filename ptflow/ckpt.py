@@ -38,6 +38,19 @@ def save(workdir: str, step: int, payload: Dict, *, keep_last: int = 2, keep_eve
     dist.barrier()
 
 
+def save_eval(workdir: str, step: int, payload: Dict) -> Path:
+    """Permanent EMA-only checkpoint for an FID point (never rotated; not used for resume)."""
+    path = Path(workdir, "checkpoints", f"eval_state_{step:08d}.pt")
+    dist.barrier()
+    if dist.is_main():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pt.tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+    dist.barrier()
+    return path
+
+
 def load(path: str | Path) -> Dict:
     return torch.load(str(path), map_location="cpu", weights_only=False)
 
